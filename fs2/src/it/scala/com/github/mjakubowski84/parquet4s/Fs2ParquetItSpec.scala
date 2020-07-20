@@ -1,6 +1,6 @@
 package com.github.mjakubowski84.parquet4s
 
-import cats.effect.IO
+import cats.effect.{ContextShift, IO, Timer}
 import com.github.mjakubowski84.parquet4s.Fs2ParquetItSpec.Data
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.scalatest.BeforeAndAfter
@@ -10,6 +10,8 @@ import org.scalatest.matchers.should.Matchers
 import scala.collection.compat.immutable.LazyList
 import scala.util.Random
 import fs2.Stream
+
+import scala.concurrent.duration._
 
 object Fs2ParquetItSpec {
 
@@ -23,6 +25,9 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
     clearTemp()
   }
 
+  implicit val contextShift: ContextShift[IO] = IO.contextShift(executionContext)
+  implicit val timer: Timer[IO] = IO.timer(executionContext)
+
   val writeOptions: ParquetWriter.Options = ParquetWriter.Options(
     compressionCodecName = CompressionCodecName.SNAPPY,
     pageSize = 512,
@@ -30,16 +35,37 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
     hadoopConf = configuration
   )
 
-  val count: Int = 4 * writeOptions.rowGroupSize
+  val count: Int = 12 * writeOptions.rowGroupSize
   val dict: Seq[String] = Vector("a", "b", "c", "d")
   val data: LazyList[Data] = LazyList
     .range(start = 0L, end = count, step = 1L)
     .map(i => Data(i = i, s = dict(Random.nextInt(4))))
 
-  it should "write and read single parquet file" in {
+//  it should "write and read single parquet file" in {
+//    val outputFileName = "data.parquet"
+//    val writeIO = Stream
+//      .iterable(data)
+//      .through(parquet.writeSingleFile[Data, IO](s"$tempPath/$outputFileName", writeOptions))
+//      .compile
+//      .drain
+//
+//    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
+//
+//    val testIO = for {
+//      _ <- writeIO
+//      readData <- readIO
+//    } yield {
+//      readData should contain theSameElementsInOrderAs data
+//    }
+//
+//    testIO.unsafeToFuture()
+//  }
+
+
+  it should "write rotating" in {
     val writeIO = Stream
       .iterable(data)
-      .through(parquet.writeSingleFile[Data, IO](tempPathString, writeOptions))
+      .through(parquet.viaParquet[Data, IO](tempPathString, writeOptions, maxDuration = 100.millis))
       .compile
       .drain
 
@@ -49,8 +75,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       _ <- writeIO
       readData <- readIO
     } yield {
-      readData.foreach(println)
-      readData should contain theSameElementsInOrderAs data
+      readData should contain theSameElementsAs data
     }
 
     testIO.unsafeToFuture()
