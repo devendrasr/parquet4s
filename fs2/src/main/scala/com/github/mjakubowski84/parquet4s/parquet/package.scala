@@ -9,7 +9,7 @@ import fs2.{Chunk, Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.hadoop.{ParquetReader => HadoopParquetReader}
 
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.language.higherKinds
 
 package object parquet {
@@ -27,6 +27,7 @@ package object parquet {
     def writePull(chunk: Chunk[T]): Pull[F, Nothing, Writer[T, F]] =
       Pull.eval(chunk.foldM(this)(_.write(_)))
 
+    // TODO test what is faster, writing chunks using unconsNonEmpty or one by one using uncons1
     def writeAll(in: Stream[F, T]): Pull[F, Nothing, Writer[T, F]] = {
       in.pull.unconsNonEmpty.flatMap {
         case Some((chunk, tail)) => writePull(chunk).flatMap(_.writeAll(tail))
@@ -35,7 +36,7 @@ package object parquet {
     }
 
     override def close(): Unit = {
-      println("Closing!")
+      println("\nClosing!")
       internalWriter.close()
     }
   }
@@ -92,17 +93,18 @@ package object parquet {
 
   def viaParquet[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]: Sync : Timer : Concurrent](path: String,
                                                                                                     options: ParquetWriter.Options = ParquetWriter.Options(),
-                                                                                                    maxDuration: FiniteDuration
+                                                                                                    maxDuration: FiniteDuration,
+                                                                                                    maxCount: Long
                                                                               ): Pipe[F, T, Unit] = {
     in =>
       for {
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
         queue <- Stream.eval(Queue.bounded[F, WriterEvent](1))
-        rotatingWriter <- Stream.resource(rotatingWriterResource[T, F](path, options, signal))
+        rotatingWriter <- Stream.eval(rotatingWriter[T, F](path, options, maxCount, signal))
         _ <- Stream(
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(queue.enqueue).interruptWhen(signal),
           in.map[WriterEvent](DataEvent.apply).append(Stream.emit(StopEvent)).through(queue.enqueue),
-          rotatingWriter.writeAll(queue.dequeue).void.stream
+          rotatingWriter.writeAll(queue.dequeue, count = 0).void.stream
         ).parJoin(3)
       } yield ()
 
@@ -112,41 +114,53 @@ package object parquet {
                                                                                         path: String,
                                                                                         options: ParquetWriter.Options,
                                                                                         writer: Writer[T, F],
-                                                                                        interrupter: SignallingRef[F, Boolean]
+                                                                                        disposeWriter: F[Unit],
+                                                                                        interrupter: SignallingRef[F, Boolean],
+                                                                                        maxCount: Long
                                                                                       )(implicit F: Sync[F]) {
 
-    def writePull(entity: T): Pull[F, Nothing, Unit] =
-      Pull.eval(writer.write(entity).void)
+    private def writePull(entity: T): Pull[F, Nothing, Unit] = Pull.eval(writer.write(entity).void)
 
-    def recreateWriterPull(tick: FiniteDuration): Pull[F, Nothing, RotatingWriter[T, F]] =
+    private def disposePull: Pull[F, Nothing, Unit] = Pull.eval(disposeWriter)
+
+    private def recreateWriterPull(tick: FiniteDuration): Pull[F, Nothing, RotatingWriter[T, F]] =
       for {
-        _ <- Pull.eval(F.delay(println(s"Rotating on ${tick.toMillis}")))
-        _ <- Pull.eval(F.delay(writer.close()))
-        // TODO use allocated!
-        newWriter <- Stream.resource(rotatingWriterResource[T, F](path, options, interrupter)).pull.headOrError
+        _ <- Pull.eval(F.delay(println(s"\nRotating on ${tick.toMillis}")))
+        _ <- disposePull
+        newWriter <- Stream.eval(rotatingWriter[T, F](path, options, maxCount, interrupter)).pull.headOrError
       } yield newWriter
 
-    def writeAll(in: Stream[F, WriterEvent]): Pull[F, Nothing, Unit] = {
+    def writeAll(in: Stream[F, WriterEvent], count: Long): Pull[F, Nothing, Unit] = {
       in.pull.uncons1.flatMap {
-        case Some((DataEvent(data: T), tail)) => writePull(data).flatMap(_ => writeAll(tail))
-        case Some((RotateEvent(tick), tail))  => recreateWriterPull(tick).flatMap(_.writeAll(tail))
-        case Some((StopEvent, _))             => Pull.eval(interrupter.set(true))
-        case None                             => Pull.done
+        case Some((DataEvent(data: T), tail)) if count < maxCount =>
+          writePull(data).flatMap(_ => writeAll(tail, count + 1))
+        case Some((DataEvent(data: T), tail)) =>
+          writePull(data).flatMap(_ => recreateWriterPull(Duration.Zero).flatMap(_.writeAll(tail, count = 0)))
+        case Some((RotateEvent(tick), tail)) =>
+          recreateWriterPull(tick).flatMap(_.writeAll(tail, count = 0))
+        case Some((StopEvent, _)) =>
+          disposePull.flatMap(_ => Pull.eval(interrupter.set(true)))
+        case None =>
+          disposePull
       }
     }
 
   }
 
-  private def rotatingWriterResource[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]](
+  private def rotatingWriter[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]](
                                                                                               path: String,
                                                                                               options: ParquetWriter.Options,
+                                                                                              maxCount: Long,
                                                                                               interrupter: SignallingRef[F, Boolean]
-                                                                                            )(implicit F: Sync[F]): Resource[F, RotatingWriter[T, F]] = {
+                                                                                            )(implicit F: Sync[F]): F[RotatingWriter[T, F]] = {
     val compressionExtension = options.compressionCodecName.getExtension
-    val fileName: String = UUID.randomUUID().toString + compressionExtension + ".parquet"
-    // TODO cannot be a normal resource... maybe allocated?
-    writerResource(s"$path/$fileName", options) // TODO no path ops on string
-      .map(writer => new RotatingWriter[T, F](path, options, writer, interrupter))
+    val fileName = UUID.randomUUID().toString + compressionExtension + ".parquet"
+    // TODO no path ops on string
+    writerResource(s"$path/$fileName", options)
+      .allocated
+      .map { case (writer, disposeWriter) =>
+        new RotatingWriter[T, F](path, options, writer, disposeWriter, interrupter, maxCount)
+      }
   }
 
 }
