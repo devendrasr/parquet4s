@@ -9,6 +9,7 @@ import fs2.concurrent.{Queue, SignallingRef}
 import fs2.{Chunk, Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.hadoop.{ParquetReader => HadoopParquetReader}
+import org.apache.parquet.schema.MessageType
 
 import scala.concurrent.duration.FiniteDuration
 import scala.language.higherKinds
@@ -44,12 +45,22 @@ package object parquet {
                                                                                     (implicit F: Sync[F]): Resource[F, Writer[T, F]] =
       Resource.fromAutoCloseable(
         for {
-          valueCodecConfiguration <- F.delay(options.toValueCodecConfiguration)
           schema <- F.delay(ParquetSchemaResolver.resolveSchema[T])
-          internalWriter <- F.delay(ParquetWriter.internalWriter(path, schema, options))
+          valueCodecConfiguration <- F.delay(options.toValueCodecConfiguration)
           encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
+          internalWriter <- F.delay(ParquetWriter.internalWriter(path, schema, options))
         } yield new Writer[T, F](internalWriter, encode)
       )
+
+  private def writerResource[T, F[_]](path: Path,
+                                      schema: MessageType,
+                                      encode: T => F[RowParquetRecord],
+                                      options: ParquetWriter.Options)
+                                     (implicit F: Sync[F]): Resource[F, Writer[T, F]] =
+    Resource.fromAutoCloseable(
+        F.delay(ParquetWriter.internalWriter(path, schema, options))
+          .map(internalWriter => new Writer[T, F](internalWriter, encode))
+    )
 
   def writeSingleFile[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]: Sync](path: String,
                                                                                     options: ParquetWriter.Options = ParquetWriter.Options()
@@ -90,7 +101,7 @@ package object parquet {
   private case class RotateEvent(tick: FiniteDuration) extends WriterEvent
   private case object StopEvent extends WriterEvent
 
-  def viaParquet[T : ParquetRecordEncoder : ParquetSchemaResolver: PartitionLens, F[_]: Sync : Timer : Concurrent](path: String,
+  def viaParquet[T : SkippingParquetRecordEncoder : SkippingParquetSchemaResolver: PartitionLens, F[_]: Sync : Timer : Concurrent](path: String,
                                                                                                                    maxDuration: FiniteDuration,
                                                                                                                    maxCount: Long,
                                                                                                                    partitionBy: Seq[String] = Seq.empty,
@@ -99,10 +110,15 @@ package object parquet {
         // TODO schema and all other configs should be resolved once here - not in every writer
     in =>
       for {
+        schema <- Stream.eval(Sync[F].delay(SkippingParquetSchemaResolver.resolveSchema[T](partitionBy)))
+        valueCodecConfiguration <- Stream.eval(Sync[F].delay(options.toValueCodecConfiguration))
+        encode = { (entity: T) => Sync[F].delay(SkippingParquetRecordEncoder.encode[T](partitionBy, entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
-        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](maxSize = 1))
+        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.rowGroupSize))
         outQueue <- Stream.eval(Queue.unbounded[F, T])
-        rotatingWriter <- Stream.emit(new RotatingWriter[T, F](new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy))
+        rotatingWriter <- Stream.emit(
+          new RotatingWriter[T, F](new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy, schema, encode)
+        )
         out <- Stream(
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),
           in.map[WriterEvent](DataEvent.apply).append(Stream.emit(StopEvent)).through(inQueue.enqueue),
@@ -112,14 +128,16 @@ package object parquet {
 
   }
 
-  private class RotatingWriter[T : ParquetRecordEncoder : ParquetSchemaResolver: PartitionLens, F[_]](
-                                                                                                       basePath: Path,
-                                                                                                       options: ParquetWriter.Options,
-                                                                                                       writersRef: Ref[F, Map[Path, Writer[T, F]]],
-                                                                                                       interrupter: SignallingRef[F, Boolean],
-                                                                                                       maxCount: Long,
-                                                                                                       partitionBy: Seq[String]
-                                                                                                     )(implicit F: Sync[F]) {
+  private class RotatingWriter[T: PartitionLens, F[_]](
+                                                        basePath: Path,
+                                                        options: ParquetWriter.Options,
+                                                        writersRef: Ref[F, Map[Path, Writer[T, F]]],
+                                                        interrupter: SignallingRef[F, Boolean],
+                                                        maxCount: Long,
+                                                        partitionBy: Seq[String],
+                                                        schema: MessageType,
+                                                        encode: T => F[RowParquetRecord]
+                                                      )(implicit F: Sync[F]) {
 
     private def writePull(entity: T): Pull[F, T, Unit] =
       Pull.eval(write(entity)) >> Pull.output1(entity)
@@ -130,14 +148,14 @@ package object parquet {
     }
 
     private def getOrCreateWriter(path: Path): F[Writer[T, F]] = {
-      writersRef.access.flatMap { case (wx, setter) =>
-        wx.get(path) match {
+      writersRef.access.flatMap { case (writers, setter) =>
+        writers.get(path) match {
           case Some(writer) =>
             F.pure(writer)
           case None =>
-            writerResource[T, F](new Path(path, newFileName), options).allocated.flatMap {
+            writerResource[T, F](new Path(path, newFileName), schema, encode, options).allocated.flatMap {
               case (writer, finalizer) =>
-                setter(wx.updated(path, writer)).flatMap {
+                setter(writers.updated(path, writer)).flatMap {
                   case true =>
                     F.pure(writer)
                   case false =>
