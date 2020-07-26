@@ -31,7 +31,7 @@ package object parquet {
     def writeAll(in: Stream[F, T]): Pull[F, Nothing, Unit] =
       in.pull.unconsNonEmpty.flatMap {
         case Some((chunk, tail)) => writePull(chunk) >> writeAll(tail)
-        case None                => Pull.pure(this)
+        case None                => Pull.done
       }
 
     override def close(): Unit = {
@@ -100,9 +100,9 @@ package object parquet {
     in =>
       for {
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
-        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](1))
+        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](maxSize = 1))
         outQueue <- Stream.eval(Queue.unbounded[F, T])
-        rotatingWriter <- Stream(new RotatingWriter[T, F](new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy))
+        rotatingWriter <- Stream.emit(new RotatingWriter[T, F](new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy))
         out <- Stream(
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),
           in.map[WriterEvent](DataEvent.apply).append(Stream.emit(StopEvent)).through(inQueue.enqueue),
@@ -119,7 +119,7 @@ package object parquet {
                                                                                                        interrupter: SignallingRef[F, Boolean],
                                                                                                        maxCount: Long,
                                                                                                        partitionBy: Seq[String]
-                                                                                      )(implicit F: Sync[F]) {
+                                                                                                     )(implicit F: Sync[F]) {
 
     private def writePull(entity: T): Pull[F, T, Unit] =
       Pull.eval(write(entity)) >> Pull.output1(entity)
@@ -185,7 +185,7 @@ package object parquet {
     }
 
     def writeAll(in: Stream[F, WriterEvent]): Stream[F, T] =
-      writeAllPull(in, 0).stream.onFinalize(dispose())
+      writeAllPull(in, count = 0).stream.onFinalize(dispose())
   }
 
 }

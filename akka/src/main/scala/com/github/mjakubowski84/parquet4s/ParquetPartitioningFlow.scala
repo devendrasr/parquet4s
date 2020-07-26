@@ -146,7 +146,7 @@ private class ParquetPartitioningFlow[T, W](
         new Path(path, s"$key=$value")
     }
 
-    private def compressionExtension = writeOptions.compressionCodecName.getExtension
+    private def compressionExtension: String = writeOptions.compressionCodecName.getExtension
     private def newFileName: String = UUID.randomUUID().toString + compressionExtension + ".parquet"
 
     private def write(msg: T): Unit = {
