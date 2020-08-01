@@ -160,7 +160,7 @@ package object parquet {
                     F.pure(writer)
                   case false =>
                     finalizer >> F.raiseError(new RuntimeException(
-                      "Concurrent writers finalisation, probably due to abrupt stream termination"
+                      "Concurrent writers access, probably due to abrupt stream termination"
                     ))
                 }
             }
