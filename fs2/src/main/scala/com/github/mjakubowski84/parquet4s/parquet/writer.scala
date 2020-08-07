@@ -1,17 +1,16 @@
 package com.github.mjakubowski84.parquet4s.parquet
 
 import cats.effect.{Resource, Sync}
+import cats.implicits._
 import com.github.mjakubowski84.parquet4s.{ParquetRecordEncoder, ParquetSchemaResolver, ParquetWriter, RowParquetRecord}
 import fs2.{Chunk, Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
-import org.apache.parquet.schema.MessageType
-import cats.implicits._
 
 import scala.language.higherKinds
 
 private[parquet4s] object writer {
 
-  class Writer[T, F[_]](internalWriter: ParquetWriter.InternalWriter, encode: T => F[RowParquetRecord])
+  private class Writer[T, F[_]](internalWriter: ParquetWriter.InternalWriter, encode: T => F[RowParquetRecord])
                                (implicit F: Sync[F]) extends AutoCloseable {
 
     def write(elem: T): F[Unit] =
@@ -44,25 +43,16 @@ private[parquet4s] object writer {
         .resource(writerResource[T, F](new Path(path), options))
         .flatMap(_.writeAll(in).stream)
 
-  def writerResource[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]](path: Path, options: ParquetWriter.Options)
+  private def writerResource[T : ParquetRecordEncoder : ParquetSchemaResolver, F[_]](path: Path,
+                                                                                     options: ParquetWriter.Options)
                                                                                     (implicit F: Sync[F]): Resource[F, Writer[T, F]] =
     Resource.fromAutoCloseable(
       for {
         schema <- F.delay(ParquetSchemaResolver.resolveSchema[T])
         valueCodecConfiguration <- F.delay(options.toValueCodecConfiguration)
-        encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
         internalWriter <- F.delay(ParquetWriter.internalWriter(path, schema, options))
+        encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
       } yield new Writer[T, F](internalWriter, encode)
-    )
-
-  def writerResource[T, F[_]](path: Path,
-                                      schema: MessageType,
-                                      encode: T => F[RowParquetRecord],
-                                      options: ParquetWriter.Options)
-                                     (implicit F: Sync[F]): Resource[F, Writer[T, F]] =
-    Resource.fromAutoCloseable(
-      F.delay(ParquetWriter.internalWriter(path, schema, options))
-        .map(internalWriter => new Writer[T, F](internalWriter, encode))
     )
 
 }

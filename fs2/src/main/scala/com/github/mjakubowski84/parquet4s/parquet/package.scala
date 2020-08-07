@@ -22,12 +22,12 @@ package object parquet {
                                                                                    ): Pipe[F, T, Unit] =
     writer.write(path, options)
 
-  def viaParquet[T : SkippingParquetRecordEncoder : SkippingParquetSchemaResolver: PartitionLens, F[_]: Sync : Timer : Concurrent](
-                                                                                                                                    path: String,
-                                                                                                                   maxDuration: FiniteDuration,
-                                                                                                                   maxCount: Long,
-                                                                                                                   partitionBy: Seq[String] = Seq.empty,
-                                                                                                                   options: ParquetWriter.Options = ParquetWriter.Options()
+  def viaParquet[T : ParquetRecordEncoder : SkippingParquetSchemaResolver, F[_]: Sync : Timer : Concurrent](
+                                                                                                             path: String,
+                                                                                                             maxDuration: FiniteDuration,
+                                                                                                             maxCount: Long,
+                                                                                                             partitionBy: Seq[String] = Seq.empty,
+                                                                                                             options: ParquetWriter.Options = ParquetWriter.Options()
   ): Pipe[F, T, T] =
     rotatingWriter.write(path, maxCount, maxDuration, partitionBy, options)
 

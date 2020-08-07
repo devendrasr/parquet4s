@@ -173,6 +173,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
         dictA should contain(aVal)
         dictB should contain(bVal)
       }
+      // TODO check if file is not empty
     }
 
     testIO.unsafeToFuture()
