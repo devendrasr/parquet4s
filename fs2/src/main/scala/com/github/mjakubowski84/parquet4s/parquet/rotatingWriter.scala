@@ -6,11 +6,11 @@ import cats.effect.concurrent.Ref
 import cats.effect.{Blocker, Concurrent, ContextShift, Sync, Timer}
 import cats.implicits._
 import com.github.mjakubowski84.parquet4s._
+import com.github.mjakubowski84.parquet4s.parquet.logger.Logger
 import fs2.concurrent.{Queue, SignallingRef}
 import fs2.{Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.schema.MessageType
-import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration.FiniteDuration
 import scala.language.higherKinds
@@ -21,16 +21,6 @@ object rotatingWriter {
   private case class DataEvent[T](data: T) extends WriterEvent
   private case class RotateEvent(tick: FiniteDuration) extends WriterEvent
   private case object StopEvent extends WriterEvent
-
-  private val logger = LoggerFactory.getLogger(getClass)
-
-  private def debug[F[_]](msg: => String)(implicit F: Sync[F]): F[Unit] =
-    F.delay(logger.isDebugEnabled).flatMap {
-      case true =>
-        F.delay(logger.debug(msg))
-      case false =>
-        F.unit
-    }
 
   private object RecordWriter {
     def apply[F[_]: Sync: ContextShift](blocker: Blocker,
@@ -57,7 +47,8 @@ object rotatingWriter {
                                         maxCount: Long,
                                         partitionBy: Seq[String],
                                         schema: MessageType,
-                                        encode: T => F[RowParquetRecord]
+                                        encode: T => F[RowParquetRecord],
+                                        logger: Logger[F]
                                       )(implicit F: Sync[F], cs: ContextShift[F]) {
 
     private def writePull(entity: T): Pull[F, T, Unit] =
@@ -80,7 +71,7 @@ object rotatingWriter {
                   case true =>
                     F.pure(writer)
                   case false =>
-                    writer.dispose >> F.raiseError(new ConcurrentModificationException(
+                    writer.dispose >> F.raiseError[RecordWriter[F]](new ConcurrentModificationException(
                       "Concurrent writers access, probably due to abrupt stream termination"
                     ))
                 }
@@ -114,7 +105,7 @@ object rotatingWriter {
       } yield ()
 
     private def rotatePull(reason: String): Pull[F, T, Unit] =
-      Pull.eval(debug(s"Rotating on $reason")) >> Pull.eval(dispose)
+      Pull.eval(logger.debug(s"Rotating on $reason")) >> Pull.eval(dispose)
 
     private def writeAllPull(in: Stream[F, WriterEvent], count: Long): Pull[F, T, Unit] = {
       in.pull.uncons1.flatMap {
@@ -144,14 +135,17 @@ object rotatingWriter {
                                                                                               )(implicit F: Sync[F], cs: ContextShift[F]): Pipe[F, T, T] =
     in =>
       for {
+        hadoopPath <- Stream.eval(io.makePath(path))
         schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[T](partitionBy)))
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
         inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.rowGroupSize))
         outQueue <- Stream.eval(Queue.unbounded[F, T])
+        logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(
-          new RotatingWriter[T, F](blocker, new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy, schema, encode)
+          new RotatingWriter[T, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
+            schema, encode, logger)
         )
         out <- Stream(
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),

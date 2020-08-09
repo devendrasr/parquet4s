@@ -16,23 +16,26 @@ private[parquet4s] object reader {
                                                         options: ParquetReader.Options,
                                                         filter: Filter)
                                                        (implicit F: Sync[F]): Stream[F, T] = {
-    val vcc = options.toValueCodecConfiguration
-    val decode = (record: RowParquetRecord) => F.delay(ParquetRecordDecoder.decode(record, vcc))
-    Stream.resource(readerResource(blocker, path, options, filter)).flatMap { reader =>
-      Stream.unfoldEval(reader) { r =>
+
+    for {
+      hadoopPath <- Stream.eval(io.makePath(path))
+      vcc <- Stream.eval(F.delay(options.toValueCodecConfiguration))
+      decode = (record: RowParquetRecord) => F.delay(ParquetRecordDecoder.decode(record, vcc))
+      reader <- Stream.resource(readerResource(blocker, hadoopPath, options, filter))
+      entity <- Stream.unfoldEval(reader) { r =>
         blocker.delay(r.read()).map(record => Option(record).map((_, r)))
       }.evalMap(decode)
-    }
+    } yield entity
   }
 
   private def readerResource[F[_]: Sync: ContextShift](blocker: Blocker,
-                                                       path: String,
+                                                       path: Path,
                                                        options: ParquetReader.Options,
                                                        filter: Filter
                                                       ): Resource[F, HadoopParquetReader[RowParquetRecord]] =
-    Resource.fromAutoCloseable(
-      blocker.delay(
-        HadoopParquetReader.builder[RowParquetRecord](new ParquetReadSupport(), new Path(path))
+    Resource.fromAutoCloseableBlocking(blocker)(
+      Sync[F].delay(
+        HadoopParquetReader.builder[RowParquetRecord](new ParquetReadSupport(), path)
           .withConf(options.hadoopConf)
           .withFilter(filter.toFilterCompat(options.toValueCodecConfiguration))
           .build()
