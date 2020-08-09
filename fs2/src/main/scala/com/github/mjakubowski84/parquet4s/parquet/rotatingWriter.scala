@@ -1,15 +1,16 @@
 package com.github.mjakubowski84.parquet4s.parquet
 
-import java.util.UUID
+import java.util.{ConcurrentModificationException, UUID}
 
 import cats.effect.concurrent.Ref
-import cats.effect.{Concurrent, Sync, Timer}
+import cats.effect.{Blocker, Concurrent, ContextShift, Sync, Timer}
 import cats.implicits._
 import com.github.mjakubowski84.parquet4s._
 import fs2.concurrent.{Queue, SignallingRef}
 import fs2.{Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.schema.MessageType
+import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration.FiniteDuration
 import scala.language.higherKinds
@@ -21,21 +22,34 @@ object rotatingWriter {
   private case class RotateEvent(tick: FiniteDuration) extends WriterEvent
   private case object StopEvent extends WriterEvent
 
+  private val logger = LoggerFactory.getLogger(getClass)
+
+  private def debug[F[_]](msg: => String)(implicit F: Sync[F]): F[Unit] =
+    F.delay(logger.isDebugEnabled).flatMap {
+      case true =>
+        F.delay(logger.debug(msg))
+      case false =>
+        F.unit
+    }
+
   private object RecordWriter {
-    def apply[F[_]](path: Path, schema: MessageType, options: ParquetWriter.Options)(implicit F: Sync[F]): F[RecordWriter[F]] =
-      // TODO Blocker needed here as blocking IO is performed (and in many other places, too)
-      F.delay(ParquetWriter.internalWriter(path, schema, options)).map(iw => new RecordWriter(iw))
+    def apply[F[_]: Sync: ContextShift](blocker: Blocker,
+                                        path: Path,
+                                        schema: MessageType,
+                                        options: ParquetWriter.Options
+                                       ): F[RecordWriter[F]] =
+      blocker.delay(ParquetWriter.internalWriter(path, schema, options)).map(iw => new RecordWriter(blocker, iw))
   }
 
-  private class RecordWriter[F[_]](internalWriter: ParquetWriter.InternalWriter)(implicit F: Sync[F]) {
+  private class RecordWriter[F[_]: Sync: ContextShift](blocker: Blocker, internalWriter: ParquetWriter.InternalWriter) {
 
-    def write(record: RowParquetRecord): F[Unit] = F.delay(internalWriter.write(record))
+    def write(record: RowParquetRecord): F[Unit] = blocker.delay(internalWriter.write(record))
 
-    def dispose: F[Unit] = F.delay(internalWriter.close())
+    def dispose: F[Unit] = blocker.delay(internalWriter.close())
 
   }
 
-  private class RotatingWriter[T, F[_]](
+  private class RotatingWriter[T, F[_]](blocker: Blocker,
                                         basePath: Path,
                                         options: ParquetWriter.Options,
                                         writersRef: Ref[F, Map[Path, RecordWriter[F]]],
@@ -44,7 +58,7 @@ object rotatingWriter {
                                         partitionBy: Seq[String],
                                         schema: MessageType,
                                         encode: T => F[RowParquetRecord]
-                                      )(implicit F: Sync[F]) {
+                                      )(implicit F: Sync[F], cs: ContextShift[F]) {
 
     private def writePull(entity: T): Pull[F, T, Unit] =
       Pull.eval(write(entity)) >> Pull.output1(entity)
@@ -60,13 +74,13 @@ object rotatingWriter {
           case Some(writer) =>
             F.pure(writer)
           case None =>
-            RecordWriter(new Path(path, newFileName), schema, options).flatMap {
+            RecordWriter(blocker, new Path(path, newFileName), schema, options).flatMap {
               writer =>
                 setter(writers.updated(path, writer)).flatMap {
                   case true =>
                     F.pure(writer)
                   case false =>
-                    writer.dispose >> F.raiseError(new RuntimeException(
+                    writer.dispose >> F.raiseError(new ConcurrentModificationException(
                       "Concurrent writers access, probably due to abrupt stream termination"
                     ))
                 }
@@ -100,7 +114,7 @@ object rotatingWriter {
       } yield ()
 
     private def rotatePull(reason: String): Pull[F, T, Unit] =
-      Pull.eval(F.delay(println(s"\nRotating on $reason"))) >> Pull.eval(dispose)
+      Pull.eval(debug(s"Rotating on $reason")) >> Pull.eval(dispose)
 
     private def writeAllPull(in: Stream[F, WriterEvent], count: Long): Pull[F, T, Unit] = {
       in.pull.uncons1.flatMap {
@@ -121,23 +135,23 @@ object rotatingWriter {
       writeAllPull(in, count = 0).stream.onFinalize(dispose)
   }
 
-  def write[F[_] : Timer : Concurrent, T: ParquetRecordEncoder : SkippingParquetSchemaResolver](
+  def write[F[_] : Timer : Concurrent, T: ParquetRecordEncoder : SkippingParquetSchemaResolver](blocker: Blocker,
                                                                                                 path: String,
                                                                                                 maxCount: Long,
                                                                                                 maxDuration: FiniteDuration,
                                                                                                 partitionBy: Seq[String],
                                                                                                 options: ParquetWriter.Options
-                                                                                              )(implicit F: Sync[F]): Pipe[F, T, T] =
+                                                                                              )(implicit F: Sync[F], cs: ContextShift[F]): Pipe[F, T, T] =
     in =>
       for {
-        schema <- Stream.eval(Sync[F].delay(SkippingParquetSchemaResolver.resolveSchema[T](partitionBy)))
+        schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[T](partitionBy)))
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
         inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.rowGroupSize))
         outQueue <- Stream.eval(Queue.unbounded[F, T])
         rotatingWriter <- Stream.emit(
-          new RotatingWriter[T, F](new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy, schema, encode)
+          new RotatingWriter[T, F](blocker, new Path(path), options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy, schema, encode)
         )
         out <- Stream(
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),

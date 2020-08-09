@@ -1,20 +1,19 @@
 package com.github.mjakubowski84.parquet4s
 
-import java.nio.file.{FileVisitOption, Paths}
+import java.nio.file.Paths
 
 import cats.effect.{Blocker, ContextShift, IO, Timer}
 import com.github.mjakubowski84.parquet4s.Fs2ParquetItSpec.{Data, DataPartitioned}
-import org.apache.parquet.hadoop.metadata.CompressionCodecName
-import org.scalatest.{BeforeAndAfter, Inspectors}
-import org.scalatest.flatspec.AsyncFlatSpec
-import org.scalatest.matchers.should.Matchers
-
-import scala.collection.compat.immutable.LazyList
-import scala.util.Random
 import fs2.Stream
 import fs2.io.file.{directoryStream, walk}
+import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.scalatest.flatspec.AsyncFlatSpec
+import org.scalatest.matchers.should.Matchers
+import org.scalatest.{BeforeAndAfter, Inspectors}
 
+import scala.collection.compat.immutable.LazyList
 import scala.concurrent.duration._
+import scala.util.Random
 
 object Fs2ParquetItSpec {
 
@@ -59,75 +58,79 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
 
   it should "write and read single parquet file" in {
     val outputFileName = "data.parquet"
-    val writeIO = Stream
+    val writeIO = (blocker: Blocker) => Stream
       .iterable(data)
-      .through(parquet.writeSingleFile[Data, IO](s"$tempPath/$outputFileName", writeOptions))
+      .through(parquet.writeSingleFile[Data, IO](blocker,s"$tempPath/$outputFileName", writeOptions))
       .compile
       .drain
 
-    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
+    val readIO = (blocker: Blocker) => parquet.read[Data, IO](blocker, tempPathString).compile.toVector
 
-    val testIO = for {
-      _ <- writeIO
-      readData <- readIO
-    } yield {
-      readData should contain theSameElementsInOrderAs data
+    val testIO = Blocker[IO].use { blocker =>
+      for {
+        _ <- writeIO(blocker)
+        readData <- readIO(blocker)
+      } yield {
+        readData should contain theSameElementsInOrderAs data
+      }
     }
 
     testIO.unsafeToFuture()
   }
 
   it should "write files and rotate by max file size" in {
-    val writeIO = Stream
+    val writeIO = (blocker: Blocker) => Stream
       .iterable(data)
-      .through(parquet.viaParquet[Data, IO](tempPathString, maxDuration = 1.minute, maxCount = writeOptions.rowGroupSize, options = writeOptions))
+      .through(parquet.viaParquet[Data, IO](blocker, tempPathString, maxDuration = 1.minute, maxCount = writeOptions.rowGroupSize, options = writeOptions))
       .compile
       .toVector
 
-    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
+    val readIO = (blocker: Blocker) => parquet.read[Data, IO](blocker, tempPathString).compile.toVector
 
-    val listParquetFilesIO = Stream.resource(Blocker[IO])
-      .flatMap(blocker => directoryStream[IO](blocker, Paths.get(tempPath.toUri)))
+    val listParquetFilesIO = (blocker: Blocker) => directoryStream[IO](blocker, Paths.get(tempPath.toUri))
       .filter(_.toString.endsWith(".parquet"))
       .compile
       .toVector
 
-    val testIO = for {
-      writtenData <- writeIO
-      readData <- readIO
-      parquetFiles <- listParquetFilesIO
-    } yield {
-      writtenData should contain theSameElementsAs data
-      readData should contain theSameElementsAs data
-      parquetFiles should have size 4
+    val testIO = Blocker[IO].use { blocker =>
+      for {
+        writtenData <- writeIO(blocker)
+        readData <- readIO(blocker)
+        parquetFiles <- listParquetFilesIO(blocker)
+      } yield {
+        writtenData should contain theSameElementsAs data
+        readData should contain theSameElementsAs data
+        parquetFiles should have size 4
+      }
     }
 
     testIO.unsafeToFuture()
   }
 
   it should "write files and rotate by max write duration" in {
-    val writeIO = Stream
+    val writeIO = (blocker: Blocker) => Stream
       .iterable(data)
-      .through(parquet.viaParquet[Data, IO](tempPathString, maxDuration = 25.millis, maxCount = count, options = writeOptions))
+      .through(parquet.viaParquet[Data, IO](blocker, tempPathString, maxDuration = 25.millis, maxCount = count, options = writeOptions))
       .compile
       .toVector
 
-    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
+    val readIO =(blocker: Blocker) =>  parquet.read[Data, IO](blocker, tempPathString).compile.toVector
 
-    val listParquetFilesIO = Stream.resource(Blocker[IO])
-      .flatMap(blocker => directoryStream[IO](blocker, Paths.get(tempPath.toUri)))
+    val listParquetFilesIO = (blocker: Blocker) => directoryStream[IO](blocker, Paths.get(tempPath.toUri))
       .filter(_.toString.endsWith(".parquet"))
       .compile
       .toVector
 
-    val testIO = for {
-      writtenData <- writeIO
-      readData <- readIO
-      parquetFiles <- listParquetFilesIO
-    } yield {
-      writtenData should contain theSameElementsAs data
-      readData should contain theSameElementsAs data
-      parquetFiles.size should be > 1
+    val testIO =  Blocker[IO].use { blocker =>
+      for {
+        writtenData <- writeIO(blocker)
+        readData <- readIO(blocker)
+        parquetFiles <- listParquetFilesIO(blocker)
+      } yield {
+        writtenData should contain theSameElementsAs data
+        readData should contain theSameElementsAs data
+        parquetFiles.size should be > 1
+      }
     }
 
     testIO.unsafeToFuture()
@@ -135,9 +138,10 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
 
 
   it should "partition written files" in {
-    val writeIO = Stream
+    val writeIO = (blocker: Blocker) => Stream
       .iterable(dataPartitioned)
       .through(parquet.viaParquet[DataPartitioned, IO](
+        blocker,
         tempPathString,
         maxDuration = 1.minute,
         maxCount = count,
@@ -149,8 +153,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
 
 //    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
 
-    val listParquetFilesIO = Stream.resource(Blocker[IO])
-      .flatMap(blocker => walk[IO](blocker, Paths.get(tempPath.toUri)))
+    val listParquetFilesIO = (blocker: Blocker) => walk[IO](blocker, Paths.get(tempPath.toUri))
       .filter(_.toString.endsWith(".parquet"))
       .compile
       .toVector
@@ -160,20 +163,24 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       (split(0), split(1))
     }
 
-    val testIO = for {
-      writtenData <- writeIO
-      parquetFiles <- listParquetFilesIO
-    } yield {
-      writtenData should contain theSameElementsAs dataPartitioned
-      parquetFiles should not be empty
-      val partitions = parquetFiles.map { path =>
-        (partitionValue(path.getParent.getParent), partitionValue(path.getParent))
+    val testIO =  Blocker[IO].use { blocker =>
+      for {
+        writtenData <- writeIO(blocker)
+        parquetFiles <- listParquetFilesIO(blocker)
+        _ <- Stream.emits(parquetFiles)
+          .evalMap(path => parquet.read[DataPartitioned, IO](blocker, path.toString).head.compile.lastOrError)
+          .compile.drain // TODO can be removed when reader will be able to read partitions
+      } yield {
+        writtenData should contain theSameElementsAs dataPartitioned
+        parquetFiles.size should be > 1
+        val partitions = parquetFiles.map { path =>
+          (partitionValue(path.getParent.getParent), partitionValue(path.getParent))
+        }
+        forEvery(partitions) { case (("a", aVal), ("b", bVal)) =>
+          dictA should contain(aVal)
+          dictB should contain(bVal)
+        }
       }
-      forEvery(partitions) { case (("a", aVal), ("b", bVal)) =>
-        dictA should contain(aVal)
-        dictB should contain(bVal)
-      }
-      // TODO check if file is not empty
     }
 
     testIO.unsafeToFuture()
