@@ -114,7 +114,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       .compile
       .toVector
 
-    val readIO =(blocker: Blocker) =>  parquet.read[Data, IO](blocker, tempPathString).compile.toVector
+    val readIO = (blocker: Blocker) =>  parquet.read[Data, IO](blocker, tempPathString).compile.toVector
 
     val listParquetFilesIO = (blocker: Blocker) => directoryStream[IO](blocker, Paths.get(tempPath.toUri))
       .filter(_.toString.endsWith(".parquet"))
@@ -137,7 +137,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
   }
 
 
-  it should "partition written files" in {
+  it should "write and read partitioned files" in {
     val writeIO = (blocker: Blocker) => Stream
       .iterable(dataPartitioned)
       .through(parquet.viaParquet[DataPartitioned, IO](
@@ -151,7 +151,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       .compile
       .toVector
 
-//    val readIO = parquet.read[Data, IO](tempPathString).compile.toVector
+    val readIO = (blocker: Blocker) =>  parquet.read[DataPartitioned, IO](blocker, tempPathString).compile.toVector
 
     val listParquetFilesIO = (blocker: Blocker) => walk[IO](blocker, Paths.get(tempPath.toUri))
       .filter(_.toString.endsWith(".parquet"))
@@ -167,9 +167,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       for {
         writtenData <- writeIO(blocker)
         parquetFiles <- listParquetFilesIO(blocker)
-        _ <- Stream.emits(parquetFiles)
-          .evalMap(path => parquet.read[DataPartitioned, IO](blocker, path.toString).head.compile.lastOrError)
-          .compile.drain // TODO can be removed when reader will be able to read partitions
+        readData <- readIO(blocker)
       } yield {
         writtenData should contain theSameElementsAs dataPartitioned
         parquetFiles.size should be > 1
@@ -180,6 +178,7 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
           dictA should contain(aVal)
           dictB should contain(bVal)
         }
+        readData should contain theSameElementsAs dataPartitioned
       }
     }
 
