@@ -22,7 +22,7 @@ private[parquet4s] object reader {
       basePath <- Stream.eval(io.makePath(path))
       vcc      <- Stream.eval(F.delay(options.toValueCodecConfiguration))
       decode = (record: RowParquetRecord) => F.delay(ParquetRecordDecoder.decode(record, vcc))
-      partitionedDirectory <- Stream.eval(io.findPartitionedPaths(blocker, basePath, options.hadoopConf))
+      partitionedDirectory <- io.findPartitionedPaths(blocker, basePath, options.hadoopConf)
       partitionData        <- Stream.eval(F.delay(PartitionFilter.filter(filter, vcc, partitionedDirectory))).flatMap(Stream.iterable)
       (partitionFilter, partitionedPath) = partitionData
       reader     <- Stream.resource(readerResource(blocker, partitionedPath.path, options, partitionFilter))

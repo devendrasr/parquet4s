@@ -132,7 +132,7 @@ object rotatingWriter {
                                                                                                 maxDuration: FiniteDuration,
                                                                                                 partitionBy: Seq[String],
                                                                                                 options: ParquetWriter.Options
-                                                                                              )(implicit F: Sync[F], cs: ContextShift[F]): Pipe[F, T, T] =
+                                                                                               )(implicit F: Sync[F], cs: ContextShift[F]): Pipe[F, T, T] =
     in =>
       for {
         hadoopPath <- Stream.eval(io.makePath(path))
@@ -140,8 +140,8 @@ object rotatingWriter {
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
-        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.rowGroupSize))
-        outQueue <- Stream.eval(Queue.unbounded[F, T])
+        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.pageSize))
+        outQueue <- Stream.eval(Queue.bounded[F, T](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(
           new RotatingWriter[T, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
@@ -151,7 +151,7 @@ object rotatingWriter {
           Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),
           in.map[WriterEvent](DataEvent.apply).append(Stream.emit(StopEvent)).through(inQueue.enqueue),
           rotatingWriter.writeAll(inQueue.dequeue).through(outQueue.enqueue)
-        ).parJoin(3).drain.mergeHaltL(outQueue.dequeue)
+        ).parJoin(maxOpen = 3).drain.mergeHaltL(outQueue.dequeue)
       } yield out
 
 }

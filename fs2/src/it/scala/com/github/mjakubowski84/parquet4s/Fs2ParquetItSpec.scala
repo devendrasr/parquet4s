@@ -55,7 +55,6 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
       b = dictB(Random.nextInt(3))
     ))
 
-
   it should "write and read single parquet file" in {
     val outputFileName = "data.parquet"
     val writeIO = (blocker: Blocker) => Stream
