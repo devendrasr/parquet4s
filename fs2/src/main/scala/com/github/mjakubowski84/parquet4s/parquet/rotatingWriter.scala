@@ -17,11 +17,11 @@ import scala.language.higherKinds
 
 object rotatingWriter {
 
-  private sealed trait WriterEvent
-  private case class DataEvent[W](data: W) extends WriterEvent
-  private case class RotateEvent(tick: FiniteDuration) extends WriterEvent // TODO tick is redundant!
-  private case class OutputEvent[O](out: O) extends WriterEvent
-  private case object StopEvent extends WriterEvent
+  private sealed trait WriterEvent[T, W]
+  private case class DataEvent[T, W](data: W) extends WriterEvent[T, W]
+  private case class RotateEvent[T, W]() extends WriterEvent[T, W]
+  private case class OutputEvent[T, W](out: T) extends WriterEvent[T, W]
+  private case class StopEvent[T, W]() extends WriterEvent[T, W]
 
   private object RecordWriter {
     def apply[F[_]: Sync: ContextShift](blocker: Blocker,
@@ -53,7 +53,7 @@ object rotatingWriter {
                                       )(implicit F: Sync[F], cs: ContextShift[F]) {
 
     private def writePull(entity: W): Pull[F, T, Unit] =
-      Pull.eval(write(entity)) >> Pull.eval(F.delay(println(s"Just wrote: $entity")))
+      Pull.eval(write(entity)) >> Pull.eval(F.delay(println(s"Just wrote: $entity"))) // TODO remove me
 
     private def newFileName: String = {
       val compressionExtension = options.compressionCodecName.getExtension
@@ -108,24 +108,24 @@ object rotatingWriter {
     private def rotatePull(reason: String): Pull[F, T, Unit] =
       Pull.eval(logger.debug(s"Rotating on $reason")) >> Pull.eval(dispose)
 
-    private def writeAllPull(in: Stream[F, WriterEvent], count: Long): Pull[F, T, Unit] = {
+    private def writeAllPull(in: Stream[F, WriterEvent[T, W]], count: Long): Pull[F, T, Unit] = {
       in.pull.uncons1.flatMap {
-        case Some((DataEvent(data: W), tail)) if count < maxCount =>
+        case Some((DataEvent(data), tail)) if count < maxCount =>
           writePull(data) >> writeAllPull(tail, count + 1)
-        case Some((DataEvent(data: W), tail)) =>
+        case Some((DataEvent(data), tail)) =>
           writePull(data) >> rotatePull("max count reached") >> writeAllPull(tail, count = 0)
-        case Some((RotateEvent(tick), tail)) =>
-          rotatePull(s"tick $tick") >> writeAllPull(tail, count = 0)
-        case Some((OutputEvent(out: T), tail)) =>
+        case Some((RotateEvent(), tail)) =>
+          rotatePull(s"write timeout") >> writeAllPull(tail, count = 0)
+        case Some((OutputEvent(out), tail)) =>
           Pull.output1(out) >> writeAllPull(tail, count)
-        case Some((StopEvent, _)) =>
+        case Some((StopEvent(), _)) =>
           Pull.eval(interrupter.set(true))
         case None =>
           Pull.done
       }
     }
 
-    def writeAll(in: Stream[F, WriterEvent]): Stream[F, T] =
+    def writeAll(in: Stream[F, WriterEvent[T, W]]): Stream[F, T] =
       writeAllPull(in, count = 0).stream.onFinalize(dispose)
   }
 
@@ -144,21 +144,21 @@ object rotatingWriter {
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: W) => F.delay(ParquetRecordEncoder.encode[W](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
-        eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.pageSize))
+        eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent[T, W]](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(
           new RotatingWriter[T, W, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
             schema, encode, logger)
         )
         out <- Stream(
-          Stream.awakeEvery[F](maxDuration) // TODO probably it is better to use metered, tick is redundant data
-            .map[WriterEvent](RotateEvent.apply)
+          Stream.awakeEvery[F](maxDuration)
+            .map(_ => RotateEvent[T, W]())
             .through(eventQueue.enqueue)
             .interruptWhen(signal)
             .drain,
           in
-            .flatMap(inputElement => prewriteTransformation(inputElement).map(DataEvent.apply).append(Stream.emit(OutputEvent(inputElement))))
-            .append(Stream.emit(StopEvent))
+            .flatMap(inputElement => prewriteTransformation(inputElement).map(DataEvent.apply[T, W]).append(Stream.emit(OutputEvent[T, W](inputElement))))
+            .append(Stream.emit(StopEvent[T, W]()))
             .through(eventQueue.enqueue)
             .drain,
           rotatingWriter.writeAll(eventQueue.dequeue)
