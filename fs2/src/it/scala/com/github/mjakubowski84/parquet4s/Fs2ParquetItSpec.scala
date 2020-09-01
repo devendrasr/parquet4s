@@ -80,7 +80,11 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
   it should "write files and rotate by max file size" in {
     val writeIO = (blocker: Blocker) => Stream
       .iterable(data)
-      .through(parquet.viaParquet[Data, IO](blocker, tempPathString, maxDuration = 1.minute, maxCount = writeOptions.rowGroupSize, options = writeOptions))
+      .through(parquet.viaParquet[IO, Data]
+        .maxCount(writeOptions.rowGroupSize)
+        .options(writeOptions)
+        .write(blocker, tempPathString)
+      )
       .compile
       .toVector
 
@@ -109,7 +113,12 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
   it should "write files and rotate by max write duration" in {
     val writeIO = (blocker: Blocker) => Stream
       .iterable(data)
-      .through(parquet.viaParquet[Data, IO](blocker, tempPathString, maxDuration = 25.millis, maxCount = count, options = writeOptions))
+      .through(parquet.viaParquet[IO, Data]
+        .maxDuration(25.millis)
+        .maxCount(count)
+        .options(writeOptions)
+        .write(blocker, tempPathString)
+      )
       .compile
       .toVector
 
@@ -139,14 +148,12 @@ class Fs2ParquetItSpec extends AsyncFlatSpec with Matchers with TestUtils with B
   it should "write and read partitioned files" in {
     val writeIO = (blocker: Blocker) => Stream
       .iterable(dataPartitioned)
-      .through(parquet.viaParquet[DataPartitioned, IO](
-        blocker,
-        tempPathString,
-        maxDuration = 1.minute,
-        maxCount = count,
-        partitionBy = List("a", "b"),
-        options = writeOptions
-      ))
+      .through(parquet.viaParquet[IO, DataPartitioned]
+        .maxCount(count)
+        .partitionBy("a", "b")
+        .options(writeOptions)
+        .write(blocker, tempPathString)
+      )
       .compile
       .toVector
 

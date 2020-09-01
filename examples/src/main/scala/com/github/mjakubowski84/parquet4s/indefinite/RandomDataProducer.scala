@@ -74,7 +74,7 @@ private class FluctuatingSchedulerActor(action: () => Unit) extends Actor {
     case ScheduleNext =>
       action()
 
-      val rate = Random.nextFloat / 10.0f
+      val rate = Random.nextFloat() / 10.0f
       val step = (delay.toMillis * rate).millis
       val (newDirection, newDelay) = direction match {
         case Up if delay + step < MaxDelay =>

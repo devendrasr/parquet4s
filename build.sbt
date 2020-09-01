@@ -115,7 +115,7 @@ lazy val examples = (project in file("examples"))
     publish / skip := true,
     publishLocal / skip := true
   )
-  .dependsOn(akka)
+  .dependsOn(akka, fs2)
 
 lazy val root = (project in file("."))
   .settings(publishSettings)

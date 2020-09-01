@@ -18,8 +18,9 @@ import scala.language.higherKinds
 object rotatingWriter {
 
   private sealed trait WriterEvent
-  private case class DataEvent[T](data: T) extends WriterEvent
-  private case class RotateEvent(tick: FiniteDuration) extends WriterEvent
+  private case class DataEvent[W](data: W) extends WriterEvent
+  private case class RotateEvent(tick: FiniteDuration) extends WriterEvent // TODO tick is redundant!
+  private case class OutputEvent[O](out: O) extends WriterEvent
   private case object StopEvent extends WriterEvent
 
   private object RecordWriter {
@@ -39,7 +40,7 @@ object rotatingWriter {
 
   }
 
-  private class RotatingWriter[T, F[_]](blocker: Blocker,
+  private class RotatingWriter[T, W, F[_]](blocker: Blocker,
                                         basePath: Path,
                                         options: ParquetWriter.Options,
                                         writersRef: Ref[F, Map[Path, RecordWriter[F]]],
@@ -47,12 +48,12 @@ object rotatingWriter {
                                         maxCount: Long,
                                         partitionBy: Seq[String],
                                         schema: MessageType,
-                                        encode: T => F[RowParquetRecord],
+                                        encode: W => F[RowParquetRecord],
                                         logger: Logger[F]
                                       )(implicit F: Sync[F], cs: ContextShift[F]) {
 
-    private def writePull(entity: T): Pull[F, T, Unit] =
-      Pull.eval(write(entity)) >> Pull.output1(entity)
+    private def writePull(entity: W): Pull[F, T, Unit] =
+      Pull.eval(write(entity)) >> Pull.eval(F.delay(println(s"Just wrote: $entity")))
 
     private def newFileName: String = {
       val compressionExtension = options.compressionCodecName.getExtension
@@ -80,7 +81,7 @@ object rotatingWriter {
       }
     }
 
-    private def write(entity: T): F[Unit] =
+    private def write(entity: W): F[Unit] =
       for {
         record <- encode(entity)
         path <- Stream.iterable(partitionBy).evalMap(partition(record)).fold(basePath) {
@@ -109,12 +110,14 @@ object rotatingWriter {
 
     private def writeAllPull(in: Stream[F, WriterEvent], count: Long): Pull[F, T, Unit] = {
       in.pull.uncons1.flatMap {
-        case Some((DataEvent(data: T), tail)) if count < maxCount =>
+        case Some((DataEvent(data: W), tail)) if count < maxCount =>
           writePull(data) >> writeAllPull(tail, count + 1)
-        case Some((DataEvent(data: T), tail)) =>
+        case Some((DataEvent(data: W), tail)) =>
           writePull(data) >> rotatePull("max count reached") >> writeAllPull(tail, count = 0)
         case Some((RotateEvent(tick), tail)) =>
           rotatePull(s"tick $tick") >> writeAllPull(tail, count = 0)
+        case Some((OutputEvent(out: T), tail)) =>
+          Pull.output1(out) >> writeAllPull(tail, count)
         case Some((StopEvent, _)) =>
           Pull.eval(interrupter.set(true))
         case None =>
@@ -126,32 +129,40 @@ object rotatingWriter {
       writeAllPull(in, count = 0).stream.onFinalize(dispose)
   }
 
-  def write[F[_] : Timer : Concurrent, T: ParquetRecordEncoder : SkippingParquetSchemaResolver](blocker: Blocker,
+  def write[F[_] : Timer : Concurrent: ContextShift, T, W: ParquetRecordEncoder : SkippingParquetSchemaResolver](blocker: Blocker,
                                                                                                 path: String,
                                                                                                 maxCount: Long,
                                                                                                 maxDuration: FiniteDuration,
                                                                                                 partitionBy: Seq[String],
+                                                                                                prewriteTransformation: T => Stream[F, W],
                                                                                                 options: ParquetWriter.Options
-                                                                                               )(implicit F: Sync[F], cs: ContextShift[F]): Pipe[F, T, T] =
+                                                                                               )(implicit F: Sync[F]): Pipe[F, T, T] =
     in =>
       for {
         hadoopPath <- Stream.eval(io.makePath(path))
-        schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[T](partitionBy)))
+        schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[W](partitionBy)))
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
-        encode = { (entity: T) => F.delay(ParquetRecordEncoder.encode[T](entity, valueCodecConfiguration)) }
+        encode = { (entity: W) => F.delay(ParquetRecordEncoder.encode[W](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](false))
-        inQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.pageSize))
-        outQueue <- Stream.eval(Queue.bounded[F, T](options.pageSize))
+        eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(
-          new RotatingWriter[T, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
+          new RotatingWriter[T, W, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
             schema, encode, logger)
         )
         out <- Stream(
-          Stream.awakeEvery[F](maxDuration).map[WriterEvent](RotateEvent.apply).through(inQueue.enqueue).interruptWhen(signal),
-          in.map[WriterEvent](DataEvent.apply).append(Stream.emit(StopEvent)).through(inQueue.enqueue),
-          rotatingWriter.writeAll(inQueue.dequeue).through(outQueue.enqueue)
-        ).parJoin(maxOpen = 3).drain.mergeHaltL(outQueue.dequeue)
+          Stream.awakeEvery[F](maxDuration) // TODO probably it is better to use metered, tick is redundant data
+            .map[WriterEvent](RotateEvent.apply)
+            .through(eventQueue.enqueue)
+            .interruptWhen(signal)
+            .drain,
+          in
+            .flatMap(inputElement => prewriteTransformation(inputElement).map(DataEvent.apply).append(Stream.emit(OutputEvent(inputElement))))
+            .append(Stream.emit(StopEvent))
+            .through(eventQueue.enqueue)
+            .drain,
+          rotatingWriter.writeAll(eventQueue.dequeue)
+        ).parJoin(maxOpen = 3)
       } yield out
 
 }
