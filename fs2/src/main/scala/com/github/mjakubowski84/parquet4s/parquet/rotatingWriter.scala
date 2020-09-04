@@ -86,7 +86,7 @@ object rotatingWriter {
         record <- encode(entity)
         path <- Stream.iterable(partitionBy).evalMap(partition(record)).fold(basePath) {
           case (path, (partitionName, partitionValue)) => new Path(path, s"$partitionName=$partitionValue")
-        }.compile.lastOrError
+        }.compile.lastOrError // TODO check if simple iteration over collection is not better
         writer <- getOrCreateWriter(path)
         _ <- writer.write(record)
       } yield ()
@@ -144,7 +144,7 @@ object rotatingWriter {
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: W) => F.delay(ParquetRecordEncoder.encode[W](entity, valueCodecConfiguration)) }
         signal <- Stream.eval(SignallingRef[F, Boolean](initial = false))
-        // TODO probably we can just use parJoin instead of queue and signal (unless bounding the queue is the issue)
+        // TODO probably we can just use parJoin instead of queue (and maybe signal) (unless bounding the queue is the issue)
         eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent[T, W]](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(

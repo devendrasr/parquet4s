@@ -28,7 +28,14 @@ package object parquet {
                                                                                                  ): Pipe[F, T, Unit] =
     writer.write(blocker, path, options)
 
-  def viaParquet[F[_], T]: Builder[F, T, T] = BuilderImpl[F, T, T]()
+  def viaParquet[F[_], T]: Builder[F, T, T] =
+    BuilderImpl[F, T, T](
+      maxCount = DefaultMaxCount,
+      maxDuration = DefaultMaxDuration,
+      preWriteTransformation = t => Stream.emit(t),
+      partitionBy = Seq.empty,
+      writeOptions = ParquetWriter.Options()
+    )
 
 
   trait Builder[F[_], T, W] {
@@ -89,12 +96,12 @@ package object parquet {
   }
 
   private case class BuilderImpl[F[_], T, W](
-                                                   maxCount: Long = DefaultMaxCount,
-                                                   maxDuration: FiniteDuration = DefaultMaxDuration,
-                                                   preWriteTransformation: T => Stream[F, W] = t => Stream.emit[F, T](t),
-                                                   partitionBy: Seq[String]  = Seq.empty,
-                                                   writeOptions: ParquetWriter.Options = ParquetWriter.Options()
-                                      ) extends Builder[F, T, W] {
+                                             maxCount: Long,
+                                             maxDuration: FiniteDuration,
+                                             preWriteTransformation: T => Stream[F, W],
+                                             partitionBy: Seq[String],
+                                             writeOptions: ParquetWriter.Options
+                                            ) extends Builder[F, T, W] {
 
     override def maxCount(maxCount: Long): Builder[F, T, W] = copy(maxCount = maxCount)
     override def maxDuration(maxDuration: FiniteDuration): Builder[F, T, W] = copy(maxDuration = maxDuration)
