@@ -143,7 +143,8 @@ object rotatingWriter {
         schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[W](partitionBy)))
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: W) => F.delay(ParquetRecordEncoder.encode[W](entity, valueCodecConfiguration)) }
-        signal <- Stream.eval(SignallingRef[F, Boolean](false))
+        signal <- Stream.eval(SignallingRef[F, Boolean](initial = false))
+        // TODO probably we can just use parJoin instead of queue and signal (unless bounding the queue is the issue)
         eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent[T, W]](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(

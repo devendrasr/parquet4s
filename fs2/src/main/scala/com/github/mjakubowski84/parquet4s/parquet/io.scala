@@ -92,6 +92,7 @@ private[parquet] object io {
   private case class Dirs(partitionedPaths: Vector[(Path, (String, String))]) extends StatusAccumulator
   private case object Files extends StatusAccumulator
 
+  // TODO remove when ready
 //  private def findPartitionedPaths[F[_]: ContextShift](blocker: Blocker,
 //                                                       fs: FileSystem,
 //                                                       path: Path,

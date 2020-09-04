@@ -1,24 +1,33 @@
 package com.github.mjakubowski84.parquet4s.fs2
 
-import java.nio.file.Files
+import java.nio.file.Paths
 import java.sql.Timestamp
 import java.util.UUID
 
 import cats.data.State
-import cats.effect.{Blocker, ExitCode, IO, IOApp, Sync}
+import cats.effect.{Blocker, ExitCode, IO, IOApp}
 import com.github.mjakubowski84.parquet4s.ParquetWriter
 import com.github.mjakubowski84.parquet4s.parquet._
-import fs2.kafka.{ProducerSettings, _}
-import fs2.{Pipe, Stream}
+import fs2.io.file.tempDirectoryStream
+import fs2.kafka._
+import fs2.{INothing, Pipe, Stream}
 import net.manub.embeddedkafka.{EmbeddedK, EmbeddedKafka}
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 
-import scala.concurrent.duration.{FiniteDuration, _}
+import scala.concurrent.duration._
 import scala.util.Random
 
 object ExampleApp extends IOApp {
 
-  private type Record = CommittableConsumerRecord[IO, String, String]
+  private type KafkaRecord = CommittableConsumerRecord[IO, String, String]
+
+  private case class Data(
+                           year: String,
+                           month: String,
+                           day: String,
+                           timestamp: Timestamp,
+                           word: String
+                         )
 
   private sealed trait Fluctuation {
     def delay: FiniteDuration
@@ -26,27 +35,21 @@ object ExampleApp extends IOApp {
   private case class Up(delay: FiniteDuration) extends Fluctuation
   private case class Down(delay: FiniteDuration) extends Fluctuation
 
-  val MinDelay: FiniteDuration = 1.milli
-  val MaxDelay: FiniteDuration = 500.millis
-  val StartDelay: FiniteDuration = 100.millis
-  private val words = Seq("Example", "how", "to", "setup", "indefinite", "stream", "with", "Parquet", "writer")
-  private def nextWord: String = words(Random.nextInt(words.size - 1))
-  private val path = Files.createTempDirectory("example").toString
-  private val writerOptions = ParquetWriter.Options(compressionCodecName = CompressionCodecName.SNAPPY)
+  private val MaxNumberOfRecordPerFile = 128
+  private val MaxDurationOfFileWrite = 10.seconds
+  private val WriterOptions = ParquetWriter.Options(compressionCodecName = CompressionCodecName.SNAPPY)
+  private val MinDelay = 1.milli
+  private val MaxDelay = 500.millis
+  private val StartDelay = 100.millis
+  private val Topic = "topic"
+  private val Words = Seq("Example", "how", "to", "setup", "indefinite", "stream", "with", "Parquet", "writer")
 
-  case class Data(
-//                   year: String,
-//                   month: String,
-//                   day: String,
-                   timestamp: Option[Timestamp],
-                   word: String
-                 )
-
+  private def nextWord(): String = Words(Random.nextInt(Words.size - 1))
 
   private val fluctuate: State[Fluctuation, Unit] = State[Fluctuation, Unit] { fluctuation =>
     val rate = Random.nextFloat() / 10.0f
     val step = (fluctuation.delay.toMillis * rate).millis
-    val newFluctuation: Fluctuation = fluctuation match {
+    val nextFluctuation = fluctuation match {
       case Up(delay) if delay + step < MaxDelay =>
         Up(delay + step)
       case Up(delay) =>
@@ -56,57 +59,69 @@ object ExampleApp extends IOApp {
       case Down(delay) =>
         Up(delay + step)
     }
-    (newFluctuation, ())
+    (nextFluctuation, ())
   }
 
-  private val Init: Fluctuation = Down(StartDelay)
-  val MaxChunkSize: Int = 128
-  val ChunkWriteTimeWindow: FiniteDuration = 10.seconds
-
-  private def write(blocker: Blocker): Pipe[IO, Record, fs2.INothing] =
-    _
-      .map(record => Data(record.record.timestamp.createTime.map(l => new Timestamp(l)), record.record.value))
-      .through(viaParquet[IO, Data]
-        .options(writerOptions)
-        .maxCount(MaxChunkSize)
-        .maxDuration(ChunkWriteTimeWindow)
-        .write(blocker, path))
-      .drain
-
-  private def pass: Pipe[IO, Record, Record] = identity
-
   override def run(args: List[String]): IO[ExitCode] = {
-
     val stream = for {
       blocker <- Stream.resource(Blocker[IO])
+      writePath <- tempDirectoryStream[IO](blocker, dir = Paths.get(sys.props("java.io.tmpdir")), prefix = "example")
       kafkaPort <- Stream
         .bracket(blocker.delay[IO, EmbeddedK](EmbeddedKafka.start()))(_ => blocker.delay[IO, Unit](EmbeddedKafka.stop()))
         .map(_.config.kafkaPort)
-      producerSettings = ProducerSettings[IO, String, String].withBootstrapServers(s"localhost:$kafkaPort")
+      producerSettings = ProducerSettings[IO, String, String]
+        .withBootstrapServers(s"localhost:$kafkaPort")
       consumerSettings = ConsumerSettings[IO, String, String]
         .withAutoOffsetReset(AutoOffsetReset.Earliest)
         .withBootstrapServers(s"localhost:$kafkaPort")
         .withGroupId("group")
       _ <- Stream(
-        Stream
-          .iterate(fluctuate.runS(Init).value)(f => fluctuate.runS(f).value)
-          .flatMap(fluctuation => Stream.sleep_(fluctuation.delay) ++ Stream.emit(nextWord))
-          .map(word => ProducerRecord(topic = "topic", key = UUID.randomUUID().toString, value = word))
-          .map(ProducerRecords.one[String, String])
-          .through(produce(producerSettings))
-          .drain,
-        consumerStream[IO]
-          .using(consumerSettings)
-          .evalTap(_.subscribeTo("topic"))
-          .flatMap(_.stream)
-          .broadcastThrough(write(blocker), pass)
-          .map(_.offset)
-          .through(commitBatchWithin(MaxChunkSize, ChunkWriteTimeWindow))
-          .drain
-      ).parJoin(2)
+          producer(producerSettings),
+          consumer(blocker, consumerSettings, writePath.toString)
+        ).parJoin(maxOpen = 2)
     } yield ()
 
     stream.compile.drain.as(ExitCode.Success)
-
   }
+
+  private def producer(producerSettings: ProducerSettings[IO, String, String]): Stream[IO, INothing] =
+    Stream
+      .iterate(fluctuate.runS(Down(StartDelay)).value)(fluctuation => fluctuate.runS(fluctuation).value)
+      .flatMap(fluctuation => Stream.sleep_(fluctuation.delay) ++ Stream.emit(nextWord()))
+      .map(word => ProducerRecord(topic = Topic, key = UUID.randomUUID().toString, value = word))
+      .map(ProducerRecords.one[String, String])
+      .through(produce(producerSettings))
+      .drain
+
+  private def consumer(blocker: Blocker,
+                       consumerSettings: ConsumerSettings[IO, String, String],
+                       writePath: String): Stream[IO, INothing] =
+    consumerStream[IO]
+      .using(consumerSettings)
+      .evalTap(_.subscribeTo(Topic))
+      .flatMap(_.stream)
+      .through(write(blocker, writePath))
+      .map(_.offset)
+      .through(commitBatchWithin(MaxNumberOfRecordPerFile, MaxDurationOfFileWrite))
+      .drain
+
+  private def write(blocker: Blocker, path: String): Pipe[IO, KafkaRecord, KafkaRecord] =
+    viaParquet[IO, KafkaRecord]
+      .options(WriterOptions)
+      .maxCount(MaxNumberOfRecordPerFile)
+      .maxDuration(MaxDurationOfFileWrite)
+      .withPreWriteTransformation[Data] { record =>
+        record.record.timestamp.createTime.map(l => new Timestamp(l)).fold[Stream[IO, Data]](Stream.empty) { timestamp =>
+          val dateTime = timestamp.toLocalDateTime
+          Stream.emit(Data(
+            year = dateTime.getYear.toString,
+            month = dateTime.getMonth.getValue.toString,
+            day = dateTime.getDayOfMonth.toString,
+            timestamp = timestamp,
+            word = record.record.value
+          ))
+        }
+      }
+      .partitionBy("year", "month", "day")
+      .write(blocker, path)
 }
