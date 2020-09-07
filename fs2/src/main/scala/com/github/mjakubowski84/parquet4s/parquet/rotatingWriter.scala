@@ -7,7 +7,6 @@ import cats.effect.{Blocker, Concurrent, ContextShift, Sync, Timer}
 import cats.implicits._
 import com.github.mjakubowski84.parquet4s._
 import com.github.mjakubowski84.parquet4s.parquet.logger.Logger
-import fs2.concurrent.{Queue, SignallingRef}
 import fs2.{Pipe, Pull, Stream}
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.schema.MessageType
@@ -41,16 +40,15 @@ object rotatingWriter {
   }
 
   private class RotatingWriter[T, W, F[_]](blocker: Blocker,
-                                        basePath: Path,
-                                        options: ParquetWriter.Options,
-                                        writersRef: Ref[F, Map[Path, RecordWriter[F]]],
-                                        interrupter: SignallingRef[F, Boolean],
-                                        maxCount: Long,
-                                        partitionBy: Seq[String],
-                                        schema: MessageType,
-                                        encode: W => F[RowParquetRecord],
-                                        logger: Logger[F]
-                                      )(implicit F: Sync[F], cs: ContextShift[F]) {
+                                           basePath: Path,
+                                           options: ParquetWriter.Options,
+                                           writersRef: Ref[F, Map[Path, RecordWriter[F]]],
+                                           maxCount: Long,
+                                           partitionBy: List[String],
+                                           schema: MessageType,
+                                           encode: W => F[RowParquetRecord],
+                                           logger: Logger[F]
+                                          )(implicit F: Sync[F], cs: ContextShift[F]) {
 
     private def writePull(entity: W): Pull[F, T, Unit] =
       Pull.eval(write(entity)) >> Pull.eval(F.delay(println(s"Just wrote: $entity"))) // TODO remove me
@@ -84,9 +82,11 @@ object rotatingWriter {
     private def write(entity: W): F[Unit] =
       for {
         record <- encode(entity)
-        path <- Stream.iterable(partitionBy).evalMap(partition(record)).fold(basePath) {
-          case (path, (partitionName, partitionValue)) => new Path(path, s"$partitionName=$partitionValue")
-        }.compile.lastOrError // TODO check if simple iteration over collection is not better
+        path <- partitionBy.traverse(partition(record)).map {
+          partitions => partitions.foldLeft(basePath) {
+            case (path, (partitionName, partitionValue)) => new Path(path, s"$partitionName=$partitionValue")
+          }
+        }
         writer <- getOrCreateWriter(path)
         _ <- writer.write(record)
       } yield ()
@@ -118,9 +118,7 @@ object rotatingWriter {
           rotatePull(s"write timeout") >> writeAllPull(tail, count = 0)
         case Some((OutputEvent(out), tail)) =>
           Pull.output1(out) >> writeAllPull(tail, count)
-        case Some((StopEvent(), _)) =>
-          Pull.eval(interrupter.set(true))
-        case None =>
+        case _ =>
           Pull.done
       }
     }
@@ -143,27 +141,31 @@ object rotatingWriter {
         schema <- Stream.eval(F.delay(SkippingParquetSchemaResolver.resolveSchema[W](partitionBy)))
         valueCodecConfiguration <- Stream.eval(F.delay(options.toValueCodecConfiguration))
         encode = { (entity: W) => F.delay(ParquetRecordEncoder.encode[W](entity, valueCodecConfiguration)) }
-        signal <- Stream.eval(SignallingRef[F, Boolean](initial = false))
-        // TODO probably we can just use parJoin instead of queue (and maybe signal) (unless bounding the queue is the issue)
-        eventQueue <- Stream.eval(Queue.bounded[F, WriterEvent[T, W]](options.pageSize))
         logger <- Stream.eval(logger[F](this.getClass))
         rotatingWriter <- Stream.emit(
-          new RotatingWriter[T, W, F](blocker, hadoopPath, options, Ref.unsafe(Map.empty), signal, maxCount, partitionBy,
-            schema, encode, logger)
+          new RotatingWriter[T, W, F](
+            blocker = blocker,
+            basePath = hadoopPath,
+            options = options,
+            writersRef = Ref.unsafe(Map.empty),
+            maxCount = maxCount,
+            partitionBy = partitionBy.toList,
+            schema = schema,
+            encode = encode,
+            logger = logger
+          )
         )
-        out <- Stream(
-          Stream.awakeEvery[F](maxDuration)
-            .map(_ => RotateEvent[T, W]())
-            .through(eventQueue.enqueue)
-            .interruptWhen(signal)
-            .drain,
+        eventStream = Stream(
+          Stream.awakeEvery[F](maxDuration).map[WriterEvent[T, W]](_ => RotateEvent[T, W]()),
           in
-            .flatMap(inputElement => prewriteTransformation(inputElement).map(DataEvent.apply[T, W]).append(Stream.emit(OutputEvent[T, W](inputElement))))
+            .flatMap { inputElement =>
+              prewriteTransformation(inputElement)
+                .map(DataEvent.apply[T, W])
+                .append(Stream.emit(OutputEvent[T, W](inputElement)))
+            }
             .append(Stream.emit(StopEvent[T, W]()))
-            .through(eventQueue.enqueue)
-            .drain,
-          rotatingWriter.writeAll(eventQueue.dequeue)
-        ).parJoin(maxOpen = 3)
+        ).parJoin(maxOpen = 2)
+        out <- rotatingWriter.writeAll(eventStream)
       } yield out
 
 }

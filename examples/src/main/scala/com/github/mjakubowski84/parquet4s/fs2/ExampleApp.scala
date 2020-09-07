@@ -124,4 +124,5 @@ object ExampleApp extends IOApp {
       }
       .partitionBy("year", "month", "day")
       .write(blocker, path)
+
 }

@@ -25,8 +25,8 @@ private[parquet4s] object reader {
       partitionedDirectory <- io.findPartitionedPaths(blocker, basePath, options.hadoopConf)
       partitionData        <- Stream.eval(F.delay(PartitionFilter.filter(filter, vcc, partitionedDirectory))).flatMap(Stream.iterable)
       (partitionFilter, partitionedPath) = partitionData
-      reader     <- Stream.resource(readerResource(blocker, partitionedPath.path, options, partitionFilter))
-      entity     <- readerStream(blocker, reader)
+      reader <- Stream.resource(readerResource(blocker, partitionedPath.path, options, partitionFilter))
+      entity <- readerStream(blocker, reader)
         .evalTap { record =>
           partitionedPath.partitions.traverse_ { case (name, value) =>
             F.delay(record.add(name.split("\\.").toList, BinaryValue(value)))
