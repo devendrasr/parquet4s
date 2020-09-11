@@ -51,7 +51,7 @@ object rotatingWriter {
                                           )(implicit F: Sync[F], cs: ContextShift[F]) {
 
     private def writePull(entity: W): Pull[F, T, Unit] =
-      Pull.eval(write(entity)) >> Pull.eval(F.delay(println(s"Just wrote: $entity"))) // TODO remove me
+      Pull.eval(write(entity))
 
     private def newFileName: String = {
       val compressionExtension = options.compressionCodecName.getExtension

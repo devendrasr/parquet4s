@@ -17,6 +17,15 @@ private[parquet] object io {
 
   private type Partition = (String, String)
 
+  private trait StatusAccumulator
+  private case object Empty extends StatusAccumulator
+  private object Dirs {
+    def apply(partitionPath: (Path, Partition)): Dirs = Dirs(Vector(partitionPath))
+  }
+  private case class Dirs(partitionPaths: Vector[(Path, Partition)]) extends StatusAccumulator
+  private case object Files extends StatusAccumulator
+  private case object Inconsistent extends StatusAccumulator
+
   private val PartitionRegexp: Regex = """([a-zA-Z0-9._]+)=([a-zA-Z0-9._]+)""".r
 
   def makePath[F[_]](path: String)(implicit F: Sync[F]): F[Path] = F.delay(new Path(path))
@@ -41,23 +50,6 @@ private[parquet] object io {
       }
   }
 
-//  def findPartitionedPaths[F[_]: ContextShift](blocker: Blocker,
-//                                               path: Path,
-//                                               configuration: Configuration)
-//                                              (implicit F: Sync[F]): F[PartitionedDirectory] =
-//    Resource.fromAutoCloseableBlocking(blocker)(F.delay(path.getFileSystem(configuration))).use { fs =>
-//
-//      findPartitionedPaths(blocker, fs, path, List.empty).flatMap(x =>
-//        F.fromEither(
-//          x.fold(
-//            PartitionedDirectory.failed,
-//            PartitionedDirectory.apply
-//          )
-//        )
-//      )
-//
-//    }
-
   def findPartitionedPaths[F[_]: ContextShift](blocker: Blocker,
                                                path: Path,
                                                configuration: Configuration)
@@ -77,51 +69,8 @@ private[parquet] object io {
       .map {
         case Left(invalidPaths) => PartitionedDirectory.failed(invalidPaths)
         case Right(partitionedPaths) => PartitionedDirectory(partitionedPaths)
-      }.flatMap { eitherDir =>
-        Stream.fromEither[F](eitherDir)
       }
-
-
-
-  private trait StatusAccumulator
-  private case object Empty extends StatusAccumulator
-  private object Dirs {
-    def empty: Dirs = Dirs(Vector.empty)
-    def apply(partitionPath: (Path, (String, String))): Dirs = Dirs(Vector(partitionPath))
-  }
-  private case class Dirs(partitionedPaths: Vector[(Path, (String, String))]) extends StatusAccumulator
-  private case object Files extends StatusAccumulator
-
-  // TODO remove when ready
-//  private def findPartitionedPaths[F[_]: ContextShift](blocker: Blocker,
-//                                                       fs: FileSystem,
-//                                                       path: Path,
-//                                                       partitions: List[Partition]
-//                                                      )(implicit F: Sync[F]): F[Either[List[Path], List[PartitionedPath]]] =
-//    blocker.delay(fs.listStatus(path))
-//      .map(_.toList.partition(_.isDirectory))
-//      .map { case (dirs, files) => (dirs.flatMap(matchPartition), files) }
-//      .flatMap {
-//        case (Nil, _) => // leaf with files
-//          F.pure(Right(List(PartitionedPath(path, partitions))))
-//        case (partitionedDirs, Nil) => // dir node
-//          partitionedDirs
-//            .traverse { case (subPath, partition) => findPartitionedPaths(blocker, fs, subPath, partitions :+ partition) }
-//            .map {
-//              _.fold[Either[List[Path], List[PartitionedPath]]](Right(List.empty)) {
-//                case (Left(invalidPaths), Left(moreInvalidPaths)) =>
-//                  Left(invalidPaths ++ moreInvalidPaths)
-//                case (Right(partitionedPaths), Right(morePartitionedPaths)) =>
-//                  Right(partitionedPaths ++ morePartitionedPaths)
-//                case (left: Left[_, _], _) =>
-//                  left
-//                case (_, left: Left[_, _]) =>
-//                  left
-//              }
-//            }
-//        case (_, _) => // path is invalid because it contains both dirs and files
-//          F.pure(Left(path :: Nil))
-//    }
+      .flatMap(Stream.fromEither[F].apply)
 
   private def findPartitionedPaths[F[_]: ContextShift](blocker: Blocker,
                                                        fs: FileSystem,
@@ -137,21 +86,24 @@ private[parquet] object io {
         case (dirs @ Dirs(partitionPaths), status) if status.isDirectory =>
           matchPartition(status).fold(dirs)(partitionPath => Dirs(partitionPaths :+ partitionPath))
         case (_: Dirs, _) =>
-          throw new RuntimeException("Inconsistent directory")
+          Inconsistent
         case (Files, status) if status.isDirectory =>
-          throw new RuntimeException("Inconsistent directory")
+          Inconsistent
         case (Files, _) =>
           Files
       }
       .flatMap {
-        case Dirs(partitionPaths) =>
+        case Dirs(partitionPaths) => // node od directory tree
           Stream.emits(partitionPaths).flatMap {
             case (subPath, partition) => findPartitionedPaths(blocker, fs, subPath, partitions :+ partition)
           }
-        case _ =>
+        case Files => // leaf of directory tree
           Stream.emit(Right(Vector(PartitionedPath(path, partitions))))
+        case Empty => // avoid redundant scans of empty dirs
+          Stream.empty
+        case Inconsistent => // mixture of dirs and files
+          Stream.emit(Left(Vector(path)))
       }
-      .handleErrorWith(_ => Stream.emit(Left(Vector(path))))
 
   private def matchPartition(fileStatus: FileStatus): Option[(Path, Partition)] = {
     val path = fileStatus.getPath
