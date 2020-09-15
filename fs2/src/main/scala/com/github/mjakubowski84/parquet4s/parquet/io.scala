@@ -24,7 +24,6 @@ private[parquet] object io {
   }
   private case class Dirs(partitionPaths: Vector[(Path, Partition)]) extends StatusAccumulator
   private case object Files extends StatusAccumulator
-  private case object Inconsistent extends StatusAccumulator
 
   private val PartitionRegexp: Regex = """([a-zA-Z0-9._]+)=([a-zA-Z0-9._]+)""".r
 
@@ -86,9 +85,9 @@ private[parquet] object io {
         case (dirs @ Dirs(partitionPaths), status) if status.isDirectory =>
           matchPartition(status).fold(dirs)(partitionPath => Dirs(partitionPaths :+ partitionPath))
         case (_: Dirs, _) =>
-          Inconsistent
+          throw new RuntimeException("Inconsistent directory")
         case (Files, status) if status.isDirectory =>
-          Inconsistent
+          throw new RuntimeException("Inconsistent directory")
         case (Files, _) =>
           Files
       }
@@ -101,9 +100,8 @@ private[parquet] object io {
           Stream.emit(Right(Vector(PartitionedPath(path, partitions))))
         case Empty => // avoid redundant scans of empty dirs
           Stream.empty
-        case Inconsistent => // mixture of dirs and files
-          Stream.emit(Left(Vector(path)))
       }
+      .handleErrorWith(_ => Stream.emit(Left(Vector(path)))) // mixture of dirs and files
 
   private def matchPartition(fileStatus: FileStatus): Option[(Path, Partition)] = {
     val path = fileStatus.getPath

@@ -1,5 +1,6 @@
 package com.github.mjakubowski84.parquet4s.parquet
 
+import java.nio.file
 import java.nio.file.Paths
 
 import cats.effect.{Blocker, ContextShift, IO}
@@ -22,6 +23,10 @@ class IoSpec extends AsyncFlatSpec with Matchers {
 
   implicit def nioToHadoopPath(nio: java.nio.file.Path): Path = new Path("file", null, nio.toString)
   implicit def hadoopToNioPath(hadoop: Path): java.nio.file.Path = Paths.get(hadoop.toUri)
+
+  private def createTempFileAtPath(blocker: Blocker, path: Path): Stream[IO, file.Path] =
+    Stream.eval(createDirectories[IO](blocker, path))
+      .flatMap(dirPath => tempFileStream[IO](blocker, dirPath, suffix = ".parquet").as(dirPath))
 
   "validateWritePath" should "fail if path already exists in create mode" in {
     val options = writeOptions.copy(writeMode = ParquetFileWriter.Mode.CREATE)
@@ -80,7 +85,10 @@ class IoSpec extends AsyncFlatSpec with Matchers {
       blocker <- Stream.resource(Blocker[IO])
       path <- tempDirectoryStream[IO](blocker, tmpDir)
       dir <- io.findPartitionedPaths[IO](blocker, path, writeOptions.hadoopConf)
-    } yield dir.paths should be(empty)
+    } yield {
+      dir.schema should be(empty)
+      dir.paths should be(empty)
+    }
 
     testStream.compile.lastOrError.unsafeToFuture()
   }
@@ -91,7 +99,10 @@ class IoSpec extends AsyncFlatSpec with Matchers {
       basePath <- tempDirectoryStream[IO](blocker, tmpDir)
       _ <- tempFileStream[IO](blocker, basePath, suffix = ".parquet")
       dir <- io.findPartitionedPaths[IO](blocker, basePath, writeOptions.hadoopConf)
-    } yield dir.paths should be(Vector(PartitionedPath(basePath, List.empty)))
+    } yield {
+      dir.schema should be(empty)
+      dir.paths should be(Vector(PartitionedPath(basePath, List.empty)))
+    }
 
     testStream.compile.lastOrError.unsafeToFuture()
   }
@@ -100,10 +111,12 @@ class IoSpec extends AsyncFlatSpec with Matchers {
     val testStream = for {
       blocker <- Stream.resource(Blocker[IO])
       basePath <- tempDirectoryStream[IO](blocker, tmpDir)
-      partitionPath <- Stream.eval(createDirectories[IO](blocker, basePath.resolve("x=1")))
-      _ <- tempFileStream[IO](blocker, partitionPath, suffix = ".parquet")
+      partitionPath <- createTempFileAtPath(blocker, basePath.resolve("x=1"))
       dir <- io.findPartitionedPaths[IO](blocker, basePath, writeOptions.hadoopConf)
-    } yield dir.paths should be(Vector(PartitionedPath(partitionPath, List("x" -> "1"))))
+    } yield {
+      dir.schema should be(List("x"))
+      dir.paths should be(Vector(PartitionedPath(partitionPath, List("x" -> "1"))))
+    }
 
     testStream.compile.lastOrError.unsafeToFuture()
   }
@@ -112,20 +125,20 @@ class IoSpec extends AsyncFlatSpec with Matchers {
     val testStream = for {
       blocker <- Stream.resource(Blocker[IO])
       basePath <- tempDirectoryStream[IO](blocker, tmpDir)
-      partition1 <- Stream.eval(createDirectories[IO](blocker, basePath.resolve("x=1/y=a/z=0_9")))
-      partition2 <- Stream.eval(createDirectories[IO](blocker, basePath.resolve("x=1/y=b/z=1_0")))
-      partition3 <- Stream.eval(createDirectories[IO](blocker, basePath.resolve("x=1/y=c/z=1_1")))
-      partition4 <- Stream.eval(createDirectories[IO](blocker, basePath.resolve("x=2/y=b/z=1_2")))
-      _ <- Stream(partition1, partition2, partition3, partition4)
-        .flatMap(path => tempFileStream[IO](blocker, path, suffix = ".parquet"))
-        .fold(())((x, y) => 1)
+      partition1 <- createTempFileAtPath(blocker, basePath.resolve("x=1/y=a/z=0_9"))
+      partition2 <- createTempFileAtPath(blocker, basePath.resolve("x=1/y=b/z=1_0"))
+      partition3 <- createTempFileAtPath(blocker, basePath.resolve("x=1/y=c/z=1_1"))
+      partition4 <- createTempFileAtPath(blocker, basePath.resolve("x=2/y=b/z=1_2"))
       dir <- io.findPartitionedPaths[IO](blocker, basePath, writeOptions.hadoopConf)
-    } yield dir.paths should be(Vector(
-      PartitionedPath(partition1, List("x" -> "1", "y" -> "a", "z" -> "0_9")),
-      PartitionedPath(partition2, List("x" -> "1", "y" -> "b", "z" -> "1_0")),
-      PartitionedPath(partition3, List("x" -> "1", "y" -> "c", "z" -> "1_1")),
-      PartitionedPath(partition4, List("x" -> "2", "y" -> "b", "z" -> "1_2"))
-    ))
+    } yield {
+      dir.schema should be(List("x", "y", "z"))
+      dir.paths should contain theSameElementsAs Vector(
+        PartitionedPath(partition1, List("x" -> "1", "y" -> "a", "z" -> "0_9")),
+        PartitionedPath(partition2, List("x" -> "1", "y" -> "b", "z" -> "1_0")),
+        PartitionedPath(partition3, List("x" -> "1", "y" -> "c", "z" -> "1_1")),
+        PartitionedPath(partition4, List("x" -> "2", "y" -> "b", "z" -> "1_2"))
+      )
+    }
 
     testStream.compile.lastOrError.unsafeToFuture()
   }
